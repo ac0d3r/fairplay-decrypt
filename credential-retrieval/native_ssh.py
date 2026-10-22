@@ -13,6 +13,20 @@ import time
 
 import paramiko
 
+KNOWN_HOSTS = Path.home() / ".cache" / "fairplay-decrypt" / "known_hosts"
+
+
+class PersistHostKeyPolicy(paramiko.MissingHostKeyPolicy):
+    """Accept an unseen host key once, then persist it for later verification."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def missing_host_key(self, client: paramiko.SSHClient, hostname: str, key: paramiko.PKey) -> None:
+        client.get_host_keys().add(hostname, key.get_name(), key)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        client.save_host_keys(str(self.path))
+
 
 class RemoteProcess:
     def __init__(self, channel: paramiko.Channel):
@@ -91,10 +105,16 @@ class SSHDevice:
             else:
                 raise RuntimeError("USB SSH tunnel did not open")
         self.client = paramiko.SSHClient()
-        self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        KNOWN_HOSTS.parent.mkdir(parents=True, exist_ok=True)
+        if not KNOWN_HOSTS.exists():
+            KNOWN_HOSTS.touch()
+        self.client.load_host_keys(str(KNOWN_HOSTS))
+        self.client.set_missing_host_key_policy(PersistHostKeyPolicy(KNOWN_HOSTS))
+        # Key host entries by UDID: the tunnel is always 127.0.0.1, but each
+        # device has its own host key.
+        host_alias = "fairplay-" + udid.lower()
         connect = {
-            "hostname": "127.0.0.1",
-            "port": port,
+            "hostname": host_alias,
             "username": "root",
             "timeout": 8,
             "allow_agent": password is None,
@@ -103,7 +123,15 @@ class SSHDevice:
         if password is not None:
             connect["password"] = password
         try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=8)
+            connect["sock"] = sock
             self.client.connect(**connect)
+        except paramiko.BadHostKeyException as exc:
+            self.close()
+            raise RuntimeError(
+                f"SSH host key for device {udid} changed; remove the entry "
+                f"for {host_alias!r} from {KNOWN_HOSTS} if this is expected"
+            ) from exc
         except paramiko.AuthenticationException as exc:
             self.close()
             if password is not None:
@@ -121,34 +149,48 @@ class SSHDevice:
             self.close()
             raise
 
-    def run(self, command: str, data: bytes | None = None) -> bytes:
+    def run(self, command: str, data: bytes | None = None, timeout: float = 120) -> bytes:
         channel = self.client.get_transport().open_session()
-        channel.settimeout(120)
+        channel.settimeout(timeout)
         channel.exec_command(command)
         if data is not None:
             channel.sendall(data)
         channel.shutdown_write()
         stdout = b""
         stderr = b""
-        while True:
-            if channel.recv_ready():
-                stdout += channel.recv(65536)
-            if channel.recv_stderr_ready():
-                stderr += channel.recv_stderr(65536)
-            if channel.exit_status_ready() and not channel.recv_ready() and not channel.recv_stderr_ready():
-                break
-            time.sleep(0.01)
-        while True:
-            chunk = channel.recv(65536)
-            if not chunk:
-                break
-            stdout += chunk
-        while True:
-            chunk = channel.recv_stderr(65536)
-            if not chunk:
-                break
-            stderr += chunk
-        status = channel.recv_exit_status()
+        deadline = time.monotonic() + timeout
+        try:
+            while True:
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(command, timeout)
+                try:
+                    if channel.recv_ready():
+                        stdout += channel.recv(65536)
+                    if channel.recv_stderr_ready():
+                        stderr += channel.recv_stderr(65536)
+                except (TimeoutError, socket.timeout) as exc:
+                    raise subprocess.TimeoutExpired(command, timeout) from exc
+                if (
+                    channel.exit_status_ready()
+                    and not channel.recv_ready()
+                    and not channel.recv_stderr_ready()
+                ):
+                    break
+                time.sleep(0.01)
+            while True:
+                chunk = channel.recv(65536)
+                if not chunk:
+                    break
+                stdout += chunk
+            while True:
+                chunk = channel.recv_stderr(65536)
+                if not chunk:
+                    break
+                stderr += chunk
+            status = channel.recv_exit_status()
+        except subprocess.TimeoutExpired:
+            channel.close()
+            raise
         channel.close()
         if status:
             message = (stdout + stderr).decode("utf-8", "replace")

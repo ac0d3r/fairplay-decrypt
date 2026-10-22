@@ -228,14 +228,14 @@ def restart_fairplayd(device: SSHDevice) -> int:
 
 def remote_pids(device: SSHDevice, executable: str) -> list[int]:
     listing = process_listing(device)
-    base = Path(executable).name
     result = []
     for line in listing.splitlines():
         fields = line.split()
         if len(fields) < 2 or not fields[0].isdigit():
             continue
-        command = " ".join(fields[1:])
-        if executable in command.split() or command.endswith(executable) or Path(command.split()[-1]).name == base:
+        # Require the full executable path as a ps token so basename collisions
+        # (e.g. another credential.ios) are not terminated by mistake.
+        if executable in fields[1:]:
             result.append(int(fields[0]))
     return result
 
