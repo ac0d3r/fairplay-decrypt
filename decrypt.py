@@ -34,15 +34,16 @@ def enclosing_app_sinf(names: set[str], bundle: str) -> str | None:
             for name in names
             if name.startswith(sc_info)
             and name.endswith(".sinf")
-            and not name.endswith(".v4.sinf")
             and name.count("/") == sc_info.count("/")
         )
         if not sinfs:
             continue
-        preferred = sc_info + Path(prefix).stem + ".sinf"
-        if preferred in sinfs:
-            return preferred
-        return sinfs[0]
+        for suffix in (".sinf", ".v4.sinf"):
+            preferred = sc_info + Path(prefix).stem + suffix
+            if preferred in sinfs:
+                return preferred
+        unversioned = [name for name in sinfs if not name.endswith(".v4.sinf")]
+        return (unversioned or sinfs)[0]
     return None
 
 
