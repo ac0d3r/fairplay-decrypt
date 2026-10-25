@@ -4,7 +4,7 @@ Retrieve a reusable 16-byte FairPlay account credential from a jailbroken
 device. The host needs Python, `ipsw`, and USB SSH. The device
 runs native programs only; it does not need Python or Frida.
 
-Tested on iOS 14 and iOS 18.
+Supports iOS 10+.
 
 ## Retrieve
 

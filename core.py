@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import hashlib
-from pathlib import Path
 import struct
-import subprocess
+from collections.abc import Iterator
+from dataclasses import dataclass
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
@@ -28,7 +27,12 @@ ROUND_SELECTORS = tuple(
 )
 ROUND_CONSTANTS = (0x6EE6B74F, 0x78B72ABF, 0xD227C8EA, 0x0C0081BC)
 FINAL_SELECTORS = ((0, 1, 2, 3), (0, 2, 4, 6), (0, 3, 5, 7), (4, 5, 6, 7))
-FINAL_WORDS = (0x85FE4668, 0x15EA8FCD, 0x3A17569B, 0x216E68E0)
+_FINAL_CONSTANTS = (
+    0x4F3DAC1FD3361949,
+    0x4F3DAC1F631A63A2,
+    0x4F3DAC1F87CD2974,
+    0x4F3DAC1F7EA63AB1,
+)
 
 
 @dataclass(frozen=True)
@@ -40,7 +44,9 @@ class MachoInfo:
 
 
 def _xor(a: bytes, b: bytes) -> bytes:
-    return bytes(x ^ y for x, y in zip(a, b, strict=True))
+    if len(a) != len(b):
+        raise ValueError("XOR inputs must have equal lengths")
+    return bytes(x ^ y for x, y in zip(a, b))
 
 
 def arm64_encryption_info(data: bytes) -> MachoInfo:
@@ -103,7 +109,7 @@ def arm64_encryption_info(data: bytes) -> MachoInfo:
     return MachoInfo(base, cryptoff, cryptsize, cryptid_offset)
 
 
-def _children(data: bytes, start: int, end: int):
+def _children(data: bytes, start: int, end: int) -> Iterator[tuple[bytes, int, int]]:
     offset = start
     while offset < end:
         if offset + 8 > end:
@@ -128,20 +134,10 @@ def _sinf_field(sinf: bytes, wanted: bytes) -> bytes:
     return sinf[fields[0][1] : fields[0][2]]
 
 
-def _atom(sinf: bytes, name: bytes) -> bytes:
-    tag = sinf.find(name)
-    if tag < 4:
-        raise ValueError(f"missing {name!r} atom")
-    size = int.from_bytes(sinf[tag - 4 : tag], "big")
-    if size < 8 or tag - 4 + size > len(sinf):
-        raise ValueError(f"invalid {name!r} atom size")
-    return sinf[tag + 4 : tag - 4 + size]
-
-
 def derive_work16(credential: bytes, sinf: bytes) -> bytes:
     name = _sinf_field(sinf, b"name").split(b"\0", 1)[0]
     iviv = _sinf_field(sinf, b"iviv")
-    raw_priv = _atom(sinf, b"priv")
+    raw_priv = _sinf_field(sinf, b"priv")
     if len(raw_priv) not in (440, 448):
         raise ValueError("unsupported SINF priv-record length")
     if len(raw_priv) == 440:
@@ -159,7 +155,11 @@ def derive_work16(credential: bytes, sinf: bytes) -> bytes:
 
 
 def arm64_supf_record_offset(supf: bytes, required_pages: int) -> int:
-    if len(supf) < 12 or supf[0] not in (3, 5) or supf[1:4] not in (b"510", b"612"):
+    if (
+        len(supf) < 12
+        or supf[0] not in (3, 5)
+        or supf[1:4] not in (b"507", b"510", b"612")
+    ):
         raise ValueError("unsupported SUPF format")
     header_size = 32 if supf[0] == 3 else 12
     count = struct.unpack_from(">I", supf, 8)[0]
@@ -182,26 +182,7 @@ def arm64_supf_record_offset(supf: bytes, required_pages: int) -> int:
 
 
 def _high8_from_context_word(word: int) -> bytes:
-    b = word.to_bytes(8, "little")
-
-    def fold(value: int, mask: int) -> int:
-        mixed = value ^ mask
-        return (mixed - (0x5A & (mixed << 1)) + 0x2D) & 255
-
-    q = b[1] ^ 0xA1
-    seventh = (q - 2 * ((b[1] & 0x52) ^ q) + 0x2D) & 255
-    return bytes(
-        (
-            fold(b[7], 0x3E) ^ 0x3E,
-            fold(b[6], 0x4A) ^ 0x24,
-            fold(b[5], 0x45) ^ 0x93,
-            fold(b[4], 0xB6) ^ 0x6D,
-            fold(b[3], 0x64) ^ 0xA4,
-            fold(b[2], 0xEB) ^ 0xDD,
-            seventh ^ 0x04,
-            (b[0] ^ 0x6C) ^ 0x5F,
-        )
-    )
+    return (word ^ 0x2D43FBF6ED1B8833).to_bytes(8, "big")
 
 
 def source_blocks(wrapped: bytes, absolute_index: int) -> tuple[bytes, bytes, bytes]:
@@ -223,12 +204,9 @@ def _mix_round(before: list[int], selectors: bytes) -> list[int]:
         b = before[selectors[pair * 2 + 1] - 0x36] ^ 0x18FB
         mixed = a + b
         square = (mixed * mixed ^ ROUND_CONSTANTS[pair]) & MASK32
-        high = (mixed >> 16) & 0xFFFF
-        low = ((0xCB61 - high * high) ^ square) & 0xFFFF
-        top = (square >> 16) & 0xFFFF
-        coded = top ^ 0x6B2
+        low = ((0xCB61 - ((mixed >> 16) & 0xFFFF) ** 2) ^ square) & 0xFFFF
         out.append(low ^ 0x18FB)
-        out.append((coded - 2 * ((coded & 0x58FF) ^ (top & 0x4004)) + 0x18FB) & 0xFFFF)
+        out.append((square >> 16) ^ 0x1E49)
     return out
 
 
@@ -241,85 +219,36 @@ def finish(state: bytes) -> bytes:
     row = initial
     for selectors in ROUND_SELECTORS:
         row = _mix_round(row, selectors)
-    final = []
-    for j, selectors in enumerate(FINAL_SELECTORS):
-        decoded = [row[i] ^ 0x18FB for i in selectors]
+    final: list[int] = []
+    for j, indices in enumerate(FINAL_SELECTORS):
+        decoded = [row[i] ^ 0x18FB for i in indices]
         left = decoded[0] | decoded[1] << 16
         right = decoded[2] | decoded[3] << 16
-        x9 = left + right
-        x19 = ((x9 & MASK32) ^ 0x9CFD58B3DE3FD77F) & MASK64
-        x9 = (((x9 << 1) & 0x1BC7FAEFE) + x19 + 0x6302A74C21C02881) & MASK64
-        x9 = (x9 * x9) & MASK64
-        x19 = (x9 << 1) & 0x9E7B583F108F031C
-        x9 = (x9 + 0x4F3DAC1F8847818E - x19) & MASK64
-        x19 = (FINAL_WORDS[j] + 0xD573525F) & MASK32
-        x22 = (x19 << 1) & 0x00000001108F031C
-        x19 = (x19 + 0x4F3DAC1F8847818E - x22) & MASK64
-        x19 ^= x9
+        x9 = ((left + right) & MASK32) ** 2 & MASK64
+        x9 ^= 0x4F3DAC1F8847818E
+        x19 = _FINAL_CONSTANTS[j] ^ x9
         x9 = x19 ^ (x9 >> 32)
         low = (x9 ^ 0xB4E4) & 0xFFFF
-        high = ((x9 >> 16) ^ 0x4F3D) & MASK32
-        high = (high - ((high << 1) & 0x31F6) + 0x18FB) & 0xFFFF
+        high = ((x9 >> 16) ^ 0x4F3D ^ 0x18FB) & 0xFFFF
         final.extend((low, high))
-    return b"".join(
-        (a ^ b).to_bytes(2, "big") for a, b in zip(initial, final, strict=True)
-    )
+    return b"".join((a ^ b).to_bytes(2, "big") for a, b in zip(initial, final))
 
 
-class BlockTransform:
-    def __init__(self, executable: Path, constants: Path):
-        if not executable.is_file() or not constants.is_file():
-            raise FileNotFoundError(
-                "build transform executable and keep constant-data file"
-            )
-        self.executable = executable
-        self.constants = constants
-        self.process = subprocess.Popen(
-            [str(executable), "--batch", str(constants)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
-        )
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        if self.process.stdin and not self.process.stdin.closed:
-            self.process.stdin.close()
-        status = self.process.wait(timeout=30)
-        error = self.process.stderr.read() if self.process.stderr else ""
-        if status and exc_type is None:
-            raise RuntimeError(f"block transform failed (exit {status}): {error}")
-
-    def __call__(self, source: bytes, work: bytes) -> bytes:
-        if len(source) != 16 or len(work) != 16:
-            raise ValueError("block-transform inputs require 16 bytes")
-        if not self.process.stdin or not self.process.stdout:
-            raise RuntimeError("block transform pipes unavailable")
-        self.process.stdin.write(f"{source.hex()} {work.hex()} {CONSTANT.hex()}\n")
-        self.process.stdin.flush()
-        line = self.process.stdout.readline()
-        if not line:
-            error = self.process.stderr.read() if self.process.stderr else ""
-            raise RuntimeError(f"block transform exited early: {error}")
-        output = bytes.fromhex(line.strip())
-        if len(output) != 16:
-            raise ValueError("block-transform output has wrong length")
-        return output
+def block_transform(source: bytes, work: bytes) -> bytes:
+    """AES-128-ECB encrypt of ``source ^ CONSTANT`` under ``work ^ WORK_MASK``."""
+    if len(source) != 16 or len(work) != 16:
+        raise ValueError("block-transform inputs require 16 bytes")
+    op = Cipher(algorithms.AES(_xor(work, WORK_MASK)), modes.ECB()).encryptor()
+    return op.update(_xor(source, CONSTANT)) + op.finalize()
 
 
-def derive_page_key(
-    wrapped: bytes, absolute_index: int, work: bytes, block: BlockTransform
-) -> bytes:
-    a, b, c = (block(source, work) for source in source_blocks(wrapped, absolute_index))
+def derive_page_key(wrapped: bytes, absolute_index: int, work: bytes) -> bytes:
+    a, b, c = (block_transform(s, work) for s in source_blocks(wrapped, absolute_index))
     return finish(_xor(finish(_xor(finish(a), b)), c))
 
 
 def decrypt_binary(
-    source: bytes, sinf: bytes, supf: bytes, credential: bytes, block: BlockTransform
+    source: bytes, sinf: bytes, supf: bytes, credential: bytes
 ) -> tuple[bytes, int]:
     info = arm64_encryption_info(source)
     page_count = info.cryptsize // PAGE_SIZE
@@ -333,7 +262,7 @@ def decrypt_binary(
         if len(record) != 32:
             raise ValueError("truncated SUPF page record")
         absolute_index = (info.base + info.cryptoff) // PAGE_SIZE + local_page
-        key = derive_page_key(record[:16], absolute_index, work, block)
+        key = derive_page_key(record[:16], absolute_index, work)
         start = info.base + info.cryptoff + PAGE_SIZE * local_page
         ciphertext = source[start : start + PAGE_SIZE]
         op = Cipher(algorithms.AES(key), modes.CBC(record[16:32])).decryptor()

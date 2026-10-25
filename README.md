@@ -13,16 +13,15 @@ eight zero bytes.
 
 ## Set up
 
-From this directory, with Python 3.10+, `uv`, and a C compiler:
+From this directory, with Python 3.9+, `uv`:
 
 ```sh
 uv venv
 uv pip install -r requirements.txt
-make
 ```
 
-On macOS, `make` also builds the credential-retrieval bundle and requires
-Xcode and `ldid`. On Linux, it builds the decryptor.
+The decryptor is pure Python. On macOS, `make` builds the
+credential-retrieval bundle and requires Xcode and `ldid`.
 
 ## Decrypt
 

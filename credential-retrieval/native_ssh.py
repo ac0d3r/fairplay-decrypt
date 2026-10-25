@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import atexit
-from pathlib import Path
 import re
 import secrets
 import shlex
 import socket
 import subprocess
 import time
+from pathlib import Path
 
 import paramiko
 
@@ -22,7 +22,9 @@ class PersistHostKeyPolicy(paramiko.MissingHostKeyPolicy):
     def __init__(self, path: Path):
         self.path = path
 
-    def missing_host_key(self, client: paramiko.SSHClient, hostname: str, key: paramiko.PKey) -> None:
+    def missing_host_key(
+        self, client: paramiko.SSHClient, hostname: str, key: paramiko.PKey
+    ) -> None:
         client.get_host_keys().add(hostname, key.get_name(), key)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         client.save_host_keys(str(self.path))
@@ -87,7 +89,18 @@ class SSHDevice:
         except OSError:
             try:
                 self.tunnel = subprocess.Popen(
-                    ["ipsw", "idev", "proxy", "--no-color", "-u", udid, "--lport", str(port), "--rport", "22"],
+                    [
+                        "ipsw",
+                        "idev",
+                        "proxy",
+                        "--no-color",
+                        "-u",
+                        udid,
+                        "--lport",
+                        str(port),
+                        "--rport",
+                        "22",
+                    ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
@@ -140,9 +153,21 @@ class SSHDevice:
         except Exception:
             self.close()
             raise
-        self.directory = "/var/tmp/fp-retrieve-" + secrets.token_hex(8)
-        self.trigger_directory = "/var/tmp/fp-trigger-" + secrets.token_hex(8)
         try:
+            temporary = (
+                self.run(
+                    "if command -v jbroot >/dev/null 2>&1; then jbroot /var/tmp; fi"
+                )
+                .decode("utf-8")
+                .strip()
+            )
+            self.ps = "/rootfs/bin/ps" if temporary else "ps"
+            if temporary and not temporary.startswith("/"):
+                raise RuntimeError("jbroot returned a non-absolute temporary directory")
+            # Native programs do not use the bootstrap shell's virtual filesystem.
+            temporary = temporary or "/var/tmp"
+            self.directory = temporary + "/fp-retrieve-" + secrets.token_hex(8)
+            self.trigger_directory = temporary + "/fp-trigger-" + secrets.token_hex(8)
             self.run("umask 077; mkdir " + shlex.quote(self.directory))
             self.run("mkdir -m 755 " + shlex.quote(self.trigger_directory))
         except Exception:
@@ -197,12 +222,14 @@ class SSHDevice:
             raise RuntimeError(f"device command failed ({status}): {message}")
         return stdout
 
-    def spawn(self, command: str, **kwargs) -> RemoteProcess:
-        del kwargs
+    def spawn(self, command: str) -> RemoteProcess:
         channel = self.client.get_transport().open_session()
         channel.exec_command(command)
         channel.shutdown_write()
         return RemoteProcess(channel)
+
+    def processes(self) -> bytes:
+        return self.run(shlex.quote(self.ps) + " -e -o pid,comm")
 
     def path(self, name: str) -> str:
         if not re.fullmatch(r"[a-zA-Z0-9_.-]+", name):
@@ -222,7 +249,12 @@ class SSHDevice:
 
     def cleanup(self) -> None:
         try:
-            self.run("rm -r -- " + shlex.quote(self.directory) + " " + shlex.quote(self.trigger_directory))
+            self.run(
+                "rm -r -- "
+                + shlex.quote(self.directory)
+                + " "
+                + shlex.quote(self.trigger_directory)
+            )
         finally:
             self.close()
 

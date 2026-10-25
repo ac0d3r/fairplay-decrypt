@@ -19,13 +19,14 @@ typedef struct {
     arm_debug_state64_t saved;
     int saved_valid;
     uint64_t return_address;
-    int selector21;
+    int matched_selector;
 } ThreadWatch;
 
 typedef struct {
     task_t task;
     mach_port_t exception_port;
     uint64_t call_address;
+    uint32_t selector;
     SelectorReturnCallback callback;
     void *context;
     ThreadWatch threads[MAX_THREADS];
@@ -48,13 +49,30 @@ static void stop_observer(int signal_number) {
     observer_stopped = 1;
 }
 
+/* Call only while the target thread is stopped (task suspension or exception).
+ * XNU 8792 can mutate DebugData in place without reloading a remote CPU's
+ * debug registers: the EL0-return path compares DebugData pointers. Clearing
+ * every enable bit first releases the thread's old object; installing the
+ * desired state then forces a fresh object and a hardware-register reload.
+ * Preserve all saved slots in the final state, including other debuggers'
+ * watchpoints.
+ */
+static kern_return_t replace_debug_state(thread_t thread, const arm_debug_state64_t *desired) {
+    arm_debug_state64_t cleared = {0};
+    kern_return_t status = thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&cleared, ARM_DEBUG_STATE64_COUNT);
+    if (status != KERN_SUCCESS) {
+        return status;
+    }
+    return thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)desired, ARM_DEBUG_STATE64_COUNT);
+}
+
 static int set_breakpoints(ThreadWatch *watch, uint64_t call_address, uint64_t return_address) {
     arm_debug_state64_t state = watch->saved;
     state.__bvr[0] = call_address;
     state.__bcr[0] = return_address ? 0 : USER_BREAKPOINT;
     state.__bvr[1] = return_address;
     state.__bcr[1] = return_address ? USER_BREAKPOINT : 0;
-    return thread_set_state(watch->port, ARM_DEBUG_STATE64, (thread_state_t)&state, ARM_DEBUG_STATE64_COUNT) == KERN_SUCCESS ? 0 : -1;
+    return replace_debug_state(watch->port, &state) == KERN_SUCCESS ? 0 : -1;
 }
 
 kern_return_t catch_exception_raise(mach_port_t exception_port, mach_port_t thread, mach_port_t task, exception_type_t exception, exception_data_t code, mach_msg_type_number_t code_count) {
@@ -91,7 +109,7 @@ kern_return_t catch_exception_raise(mach_port_t exception_port, mach_port_t thre
     }
 
     if (pc == observer->call_address && !watch->return_address) {
-        watch->selector21 = state.__x[1] == 21;
+        watch->matched_selector = state.__x[1] == observer->selector;
         watch->return_address = (uint64_t)(uintptr_t)arm_thread_state64_get_lr(state);
         if (!watch->return_address || set_breakpoints(watch, observer->call_address, watch->return_address)) {
             observer->result = -1;
@@ -110,7 +128,7 @@ kern_return_t catch_exception_raise(mach_port_t exception_port, mach_port_t thre
             return KERN_FAILURE;
         }
 
-        if (watch->selector21) {
+        if (watch->matched_selector) {
             int result = observer->callback(observer->task, observer->context);
             if (result) {
                 observer->result = result;
@@ -158,7 +176,7 @@ static void restore_observer(Observer *observer) {
         for (size_t i = 0; i < observer->thread_count; i++) {
             ThreadWatch *watch = &observer->threads[i];
             if (watch->saved_valid) {
-                thread_set_state(watch->port, ARM_DEBUG_STATE64, (thread_state_t)&watch->saved, ARM_DEBUG_STATE64_COUNT);
+                replace_debug_state(watch->port, &watch->saved);
             }
             mach_port_deallocate(mach_task_self(), watch->port);
         }
@@ -188,13 +206,14 @@ static void restore_observer(Observer *observer) {
     }
 }
 
-int observe_selector21(pid_t pid, SelectorReturnCallback callback, void *context, unsigned seconds) {
+int observe_fairplay_requests(pid_t pid, uint32_t selector, SelectorReturnCallback callback, void *context, unsigned seconds) {
     Observer *observer = calloc(1, sizeof(*observer));
-    if (!observer || !callback || seconds == 0) {
+    if (!observer || !callback || seconds == 0 || (selector != 9 && selector != 21)) {
         free(observer);
         return -1;
     }
 
+    observer->selector = selector;
     observer->callback = callback;
     observer->context = context;
     observer->task = MACH_PORT_NULL;
@@ -289,7 +308,7 @@ int observe_selector21(pid_t pid, SelectorReturnCallback callback, void *context
     sigaction(SIGALRM, &action, &old_alarm);
     task_resume(observer->task);
     alarm(seconds);
-    fprintf(stderr, "observing selector 21 in pid %d for up to %u seconds\n", pid, seconds);
+    fprintf(stderr, "observing FairPlay requests with selector %u in pid %d for up to %u seconds\n", selector, pid, seconds);
     while (!observer_stopped) {
         mach_msg_return_t received = mach_msg_server_once(exc_server, 4096, observer->exception_port, MACH_RCV_INTERRUPT);
         if (received != MACH_MSG_SUCCESS && received != MACH_RCV_INTERRUPTED) {

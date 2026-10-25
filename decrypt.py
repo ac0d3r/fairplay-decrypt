@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """Decrypt an authorized IPA using a 16-byte credential."""
 
+from __future__ import annotations
+
 import argparse
+import copy
 import os
-from pathlib import Path
+import shutil
 import tempfile
+from pathlib import Path
 from zipfile import ZipFile
 
-from core import BlockTransform, arm64_encryption_info, decrypt_binary
+from core import arm64_encryption_info, decrypt_binary
 
 ROOT = Path(__file__).resolve().parent
+COPY_BUFSIZE = 64 * 1024
 
 
 def supf_paths(names: set[str]) -> list[str]:
@@ -69,9 +74,7 @@ def main() -> None:
     credential = args.credential.read_bytes()
     if len(credential) != 16:
         parser.error("credential must contain exactly 16 bytes")
-    with BlockTransform(
-        ROOT / "transform", ROOT / "transform_const_data.bin"
-    ) as transform, ZipFile(args.ipa) as archive:
+    with ZipFile(args.ipa) as archive:
         members = archive.namelist()
         names = set(members)
         if len(names) != len(members):
@@ -121,25 +124,36 @@ def main() -> None:
         replacements = {}
         total_pages = 0
         for ordinal, (binary_path, source, sinf, supf) in enumerate(plan, 1):
-            result, pages = decrypt_binary(source, sinf, supf, credential, transform)
+            result, pages = decrypt_binary(source, sinf, supf, credential)
             replacements[binary_path] = result
             total_pages += pages
             print(f"{ordinal:02d}/{len(plan)} pages={pages} {binary_path}", flush=True)
+        del plan, source
         args.output.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
-            prefix="fairplay-linux-output-", dir=args.output.parent
+            prefix="fairplay-output-", dir=args.output.parent
         ) as temp:
             provisional = Path(temp) / "provisional.ipa"
             with ZipFile(provisional, "w") as output:
                 for entry in archive.infolist():
-                    data = (
-                        replacements[entry.filename]
-                        if entry.filename in replacements
-                        else archive.read(entry.filename)
-                    )
-                    output.writestr(entry, data)
+                    info = copy.copy(entry)
+                    if entry.filename in replacements:
+                        data = replacements[entry.filename]
+                        info.file_size = len(data)
+                        with output.open(info, "w") as destination:
+                            view = memoryview(data)
+                            for offset in range(0, len(view), COPY_BUFSIZE):
+                                destination.write(view[offset : offset + COPY_BUFSIZE])
+                    else:
+                        with (
+                            archive.open(entry, "r") as member,
+                            output.open(info, "w") as destination,
+                        ):
+                            shutil.copyfileobj(member, destination, length=COPY_BUFSIZE)
             os.link(provisional, args.output)
-    print(f"decrypted-binaries={len(replacements)} pages={total_pages} output={args.output}")
+    print(
+        f"decrypted-binaries={len(replacements)} pages={total_pages} output={args.output}"
+    )
 
 
 if __name__ == "__main__":
